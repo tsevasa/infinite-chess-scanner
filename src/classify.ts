@@ -14,6 +14,7 @@ import type { Tiles } from './tiles.js';
 
 import { project } from './homography.js';
 import {
+	correctPhotoSampling,
 	fitTemplate,
 	glowAt,
 	innerMask,
@@ -22,6 +23,7 @@ import {
 	patchSums,
 	photoBackground,
 	rankFits,
+	recoverPhotoFits,
 	refinePhotoFits,
 } from './matcher.js';
 import { royalCounterpart } from './pieces.js';
@@ -39,6 +41,8 @@ export interface Reader {
 	detectsCovers: boolean;
 	/** Cells inferred across a small gap, whose interiors must independently prove visible structure. */
 	inferred?: ReadonlySet<string>;
+	/** Cells whose tile surface is directly supported by the board region. */
+	direct?: ReadonlySet<string>;
 }
 
 /** The screen pixels a square is compared over at pixel level, and where each falls in it. */
@@ -80,50 +84,215 @@ const CHECK_GLOW_REDNESS = 0.15;
 /** Decides what a square holds, from its patch compared at its size class. */
 export function classify(
 	reader: Reader,
-	{ square, sizeClass, mean, patch }: SampledSquare,
+	{ square, sizeClass, mean, patch: originalPatch }: SampledSquare,
 	matchers: (sizeClass: SizeClass) => Matcher,
 ): Verdict {
 	const { tiles } = reader;
+	let patch = originalPatch;
 	if (patch === undefined || isPlain(patch, innerMask(sizeClass.samples))) return backgroundVerdict(mean, tiles); // prettier-ignore
 	const matcher = matchers(sizeClass);
+	let uncertainInferred = false;
 	if (matcher.photographed && reader.inferred?.has(`${square.column},${square.row}`)) {
 		const background = photoBackground(patch, matcher.samples);
 		// A conservative small-sample margin on four side blocks avoids assuming every
 		// camera pixel independent; the blocks themselves can remain correlated.
-		if (background.interior <= background.noise + 4.6 * background.noiseUncertainty)
-			return { kind: 'obscured' };
+		uncertainInferred =
+			background.interior <= background.noise + 4.6 * background.noiseUncertainty;
 	}
-	if (matcher.photographed && isPhotographicBackground(patch, matcher.samples))
-		return backgroundVerdict(mean, tiles);
+	if (
+		matcher.photographed &&
+		isPhotographicBackground(patch, matcher.samples) &&
+		!(uncertainInferred && hasTwoPhotoCorners(reader.view, square))
+	)
+		return uncertainInferred ? { kind: 'obscured' } : backgroundVerdict(mean, tiles);
 
-	const sums = patchSums(matcher, patch);
+	let sums = patchSums(matcher, patch);
 	let ranked = rankFits(matcher, patch, sums);
-	const background = fitTemplate(matcher.empty, matcher, patch, sums);
+	let background = fitTemplate(matcher.empty, matcher, patch, sums);
 	if (matcher.photographed) {
+		const initialBackground = photoBackground(patch, matcher.samples);
+		// When a supported tile's held-out interior agrees with its perimeter noise and
+		// no centered glyph improves the background, alignment need not search bare noise.
+		if (
+			ranked[0]!.residual >= background.residual &&
+			initialBackground.interior <=
+				initialBackground.noise + 2 * initialBackground.noiseUncertainty &&
+			(reader.direct?.has(`${square.column},${square.row}`) ||
+				hasMeasuredCorners(reader.view, square))
+		)
+			return uncertainInferred ? { kind: 'obscured' } : backgroundVerdict(mean, tiles);
 		// Display stripes make bare tiles busy. A clean background fit that decisively beats
 		// every glyph needs no expensive search over shifted photographic templates.
 		if (
 			ranked[0]!.residual >= 2 * background.residual &&
 			background.residual <= 0.01 * matcher.compared
 		)
-			return backgroundVerdict(mean, tiles);
-		const unaligned = ranked;
-		ranked = refinePhotoFits(matcher, patch, sums, unaligned);
-		const noise = ranked[0]!.noise ?? 0;
-		// An unexplained shape beside independently measured tile corners can need a wider
-		// correction for local grid drift when one sample spans less than two camera pixels.
-		// It must already fit near the bare background, and improve materially after shifting.
-		if (
-			square.size < 2 * matcher.samples &&
-			ranked[0]!.residual > PIECE_FIT_RATIO * background.residual &&
-			ranked[0]!.residual <= 1.05 * background.residual &&
-			noise <= 0.03 &&
-			background.residual > 1.3 * noise * matcher.compared &&
-			hasMeasuredCorners(reader.view, square)
-		) {
-			const wider = refinePhotoFits(matcher, patch, sums, unaligned, true);
-			if (wider[0]!.residual < 0.8 * ranked[0]!.residual)
-				ranked = [...ranked, ...wider].sort((a, b) => a.residual - b.residual);
+			return uncertainInferred ? { kind: 'obscured' } : backgroundVerdict(mean, tiles);
+		// A supported tile whose glyphs lose to background and whose interior is mostly
+		// camera noise needs no alignment. Keep the cover checks below for ambiguous cells.
+		if (!(
+			ranked[0]!.residual >= background.residual &&
+			initialBackground.interior <= 2 * initialBackground.noise &&
+			(reader.direct?.has(`${square.column},${square.row}`) ||
+				hasMeasuredCorners(reader.view, square))
+		)) {
+			let unaligned = ranked;
+			ranked = refinePhotoFits(matcher, patch, sums, unaligned);
+			const before = photoBackground(patch, matcher.samples);
+			if (
+				square.size < 3 * matcher.samples &&
+				before.noise > 0.03 &&
+				before.interior > before.noise + 3 * before.noiseUncertainty &&
+				hasMeasuredCorners(reader.view, square)
+			) {
+				const corrected = correctPhotoSampling(
+					reader.pic,
+					reader.view.pieces.local?.get(`${square.column},${square.row}`) ??
+						reader.view.pieces.toImage,
+					square,
+					matcher.samples,
+					patch,
+				);
+				if (corrected) {
+					const evidence = photoBackground(corrected, matcher.samples);
+					const correctedSums = patchSums(matcher, corrected);
+					const correctedBackground = fitTemplate(
+						matcher.empty,
+						matcher,
+						corrected,
+						correctedSums,
+					);
+					const correctedInitial = rankFits(matcher, corrected, correctedSums);
+					const correctedRanked = refinePhotoFits(
+						matcher,
+						corrected,
+						correctedSums,
+						correctedInitial,
+					);
+					if (
+						evidence.interior > evidence.noise + 4.6 * evidence.noiseUncertainty &&
+						correctedRanked[0]!.residual <= 0.5 * correctedBackground.residual &&
+						correctedRanked[0]!.residual < 0.8 * ranked[0]!.residual &&
+						(correctedRanked[0]!.noise ?? Infinity) <= 0.03
+					) {
+						patch = corrected;
+						sums = correctedSums;
+						background = correctedBackground;
+						ranked = correctedRanked;
+						unaligned = correctedInitial;
+						uncertainInferred = false;
+					}
+				}
+			}
+			const noise = ranked[0]!.noise ?? 0;
+			const independent = photoBackground(patch, matcher.samples);
+			// When a shape is clear but its fitted color has collapsed toward gray, align all of
+			// that shape's players before settling its hue; coarse sampling can hide the black outline.
+			const collapsedHue =
+				(ranked[0]!.response?.gain ?? 1) < 0.45 &&
+				ranked[0]!.residual <= 0.5 * background.residual &&
+				noise <= 0.03 &&
+				independent.interior > independent.noise + 4.6 * independent.noiseUncertainty &&
+				hasTwoPhotoCorners(reader.view, square);
+			const cornerAnchoredPose =
+				reader.direct?.has(`${square.column},${square.row}`) &&
+				hasMeasuredCorners(reader.view, square) &&
+				(ranked[0]!.response?.gain ?? 0) >= 0.5 &&
+				ranked[0]!.residual > 0.5 * background.residual &&
+				ranked[0]!.residual <= PIECE_FIT_RATIO * background.residual &&
+				noise <= independent.noise &&
+				independent.interior <= independent.noise + 2 * independent.noiseUncertainty;
+			if (collapsedHue || cornerAnchoredPose) {
+				const kind = ranked[0]!.template.sprite!.piece.kind.code;
+				const variants = matcher.variants
+					.get(kind)!
+					.map((index) => fitTemplate(matcher.template(index), matcher, patch!, sums));
+				const hues = refinePhotoFits(matcher, patch, sums, variants, true, variants.length);
+				const sameGlyph = hues[0]!.template.index === ranked[0]!.template.index;
+				if (
+					(hues[0]!.response?.gain ?? 0) >= 0.45 &&
+					hues[0]!.residual <= 0.5 * background.residual &&
+					hues[0]!.residual <
+						(cornerAnchoredPose && sameGlyph ? 0.85 : 0.8) * ranked[0]!.residual
+				)
+					ranked = [...ranked, ...hues].sort((a, b) => a.residual - b.residual);
+			}
+			const uncertainShape =
+				ranked[0]!.residual > PIECE_FIT_RATIO * background.residual ||
+				(ranked[0]!.residual > 0.5 * background.residual &&
+					noise > independent.noise + 3 * independent.noiseUncertainty) ||
+				((ranked[0]!.response?.gain ?? 1) < 0.45 &&
+					ranked[0]!.residual > 0.35 * background.residual &&
+					ranked[0]!.residual < PIECE_FIT_RATIO * background.residual);
+			if (
+				(square.size < 3 * matcher.samples ||
+					(square.size < 4 * matcher.samples &&
+						independent.interior >
+							independent.noise + 4.6 * independent.noiseUncertainty)) &&
+				uncertainShape &&
+				ranked[0]!.residual <= 1.05 * background.residual &&
+				(ranked[0]!.residual < background.residual ||
+					independent.interior > 2 * independent.noise) &&
+				(ranked[0]!.residual < 0.98 * background.residual ||
+					independent.interior >
+						independent.noise + 4.6 * independent.noiseUncertainty) &&
+				((ranked[0]!.response?.gain ?? 1) >= 0.45 ||
+					independent.interior >
+						independent.noise + 4.6 * independent.noiseUncertainty) &&
+				noise <= 0.05 &&
+				(independent.interior > independent.noise + 3 * independent.noiseUncertainty ||
+					(uncertainInferred &&
+						(hasTwoPhotoCorners(reader.view, square) ||
+							hasObservedPhotoPlane(reader.view, square))) ||
+					(reader.direct?.has(`${square.column},${square.row}`) &&
+						hasMeasuredCorners(reader.view, square))) &&
+				(hasMeasuredCorners(reader.view, square) ||
+					hasLocalPhotoCorners(reader.view, square) ||
+					(reader.direct?.has(`${square.column},${square.row}`) &&
+						independent.interior >
+							independent.noise + 4.6 * independent.noiseUncertainty) ||
+					(reader.inferred?.has(`${square.column},${square.row}`) &&
+						(independent.interior >
+							independent.noise + 4.6 * independent.noiseUncertainty ||
+							hasTwoPhotoCorners(reader.view, square) ||
+							hasObservedPhotoPlane(reader.view, square))))
+			) {
+				// With weak held-out structure, only reopen already shortlisted shapes. A smooth
+				// camera tile need not try every glyph merely because its corners are measured.
+				const kinds =
+					independent.interior <= independent.noise + 3 * independent.noiseUncertainty
+						? new Set(
+								unaligned
+									.slice(0, 6)
+									.map((fit) => fit.template.sprite!.piece.kind.code),
+							)
+						: undefined;
+				const recovered = recoverPhotoFits(matcher, patch, sums, kinds);
+				const sameGlyph =
+					recovered[0]!.template.index === ranked[0]!.template.index &&
+					(recovered[0]!.response?.gain ?? 0) >= 0.5 &&
+					(recovered[0]!.noise ?? Infinity) <= independent.noise;
+				if (
+					recovered[0]!.residual < (sameGlyph ? 0.85 : 0.8) * ranked[0]!.residual &&
+					recovered[0]!.residual <= 0.5 * background.residual
+				)
+					ranked = [...ranked, ...recovered].sort((a, b) => a.residual - b.residual);
+			}
+			// An unexplained shape beside independently measured tile corners can need a wider
+			// correction for local grid drift when one sample spans less than two camera pixels.
+			// It must already fit near the bare background, and improve materially after shifting.
+			if (
+				square.size < 2 * matcher.samples &&
+				ranked[0]!.residual > PIECE_FIT_RATIO * background.residual &&
+				ranked[0]!.residual <= 1.05 * background.residual &&
+				noise <= 0.03 &&
+				background.residual > 1.3 * noise * matcher.compared &&
+				hasMeasuredCorners(reader.view, square)
+			) {
+				const wider = refinePhotoFits(matcher, patch, sums, unaligned, true);
+				if (wider[0]!.residual < 0.8 * ranked[0]!.residual)
+					ranked = [...ranked, ...wider].sort((a, b) => a.residual - b.residual);
+			}
 		}
 	}
 	const samples = matcher.compared;
@@ -131,6 +300,106 @@ export function classify(
 		? 0.06 + 2 * Math.min(0.03, ranked[0]!.noise ?? 0)
 		: 0.04;
 	const unexplainedRatio = matcher.photographed ? 0.45 : PIECE_FIT_RATIO;
+	const cameraBackground = matcher.photographed
+		? photoBackground(patch, matcher.samples)
+		: undefined;
+	if (
+		cameraBackground &&
+		!reader.inferred?.has(`${square.column},${square.row}`) &&
+		ranked[0]!.residual >= background.residual &&
+		(cameraBackground.interior <=
+			cameraBackground.noise + 2 * cameraBackground.noiseUncertainty ||
+			(reader.direct?.has(`${square.column},${square.row}`) &&
+				ranked[0]!.residual >= 1.25 * background.residual &&
+				background.residual <= 0.025 * samples)) &&
+		(reader.direct?.has(`${square.column},${square.row}`) ||
+			hasMeasuredCorners(reader.view, square) ||
+			hasLocalPhotoCorners(reader.view, square))
+	)
+		return backgroundVerdict(mean, tiles);
+	const supportedCameraShape =
+		cameraBackground &&
+		hasTwoPhotoCorners(reader.view, square) &&
+		(ranked[0]!.response?.gain ?? 0) >= 0.5 &&
+		(ranked[0]!.noise ?? Infinity) <= cameraBackground.noise &&
+		ranked[0]!.residual <= 0.75 * background.residual;
+	if (
+		uncertainInferred &&
+		!supportedCameraShape &&
+		ranked[0]!.residual > 0.5 * background.residual
+	)
+		return { kind: 'obscured' };
+	// A circle has few distinguishing edges; a fingertip can otherwise imitate one across a gap.
+	if (
+		cameraBackground &&
+		reader.inferred?.has(`${square.column},${square.row}`) &&
+		ranked[0]!.template.sprite!.piece.kind.code === 'ob' &&
+		ranked[0]!.residual > 0.4 * background.residual &&
+		(cameraBackground.interior <=
+			cameraBackground.noise + 3 * cameraBackground.noiseUncertainty ||
+			Math.max(...ranked[0]!.response!.offset) - Math.min(...ranked[0]!.response!.offset) >
+				0.08)
+	)
+		return { kind: 'obscured' };
+	if (
+		matcher.photographed &&
+		reader.inferred?.has(`${square.column},${square.row}`) &&
+		ranked[0]!.template.sprite!.piece.kind.code !== 'ob' &&
+		!supportedCameraShape &&
+		ranked[0]!.residual > 0.6 * background.residual
+	)
+		return { kind: 'obscured' };
+	// At weak brightness gain, the glyph must improve the independently fitted smooth tile,
+	// and its bare-pixel errors cannot account for most of the original background error.
+	if (
+		reader.detectsCovers &&
+		cameraBackground &&
+		(ranked[0]!.response?.gain ?? 1) < 0.45 &&
+		((ranked[0]!.noise ?? 0) * samples >= 0.8 * background.residual ||
+			ranked[0]!.residual >= 0.8 * cameraBackground.interior * samples)
+	)
+		return { kind: 'obscured' };
+	// A weak glyph fit needs independently significant structure inside the tile as well.
+	if (
+		reader.detectsCovers &&
+		cameraBackground &&
+		ranked[0]!.residual >
+			((ranked[0]!.response?.gain ?? 1) < 0.45 ? 0.35 : 0.5) * background.residual &&
+		cameraBackground.interior <=
+			cameraBackground.noise +
+				((ranked[0]!.response?.gain ?? 1) < 0.45 ? 4.6 : 2) *
+					cameraBackground.noiseUncertainty
+	)
+		return { kind: 'obscured' };
+	// Large errors on the sprite's bare pixels require stronger evidence of its shape.
+	if (
+		reader.detectsCovers &&
+		matcher.photographed &&
+		(ranked[0]!.noise ?? 0) > 0.03 &&
+		ranked[0]!.residual >
+			(ranked[0]!.template.sprite!.piece.kind.code === 'ob' ? 0.7 : 0.5) * background.residual
+	)
+		return { kind: 'obscured' };
+	// A glyph must also explain the pixels it leaves bare. Foreground edges and text can
+	// weakly resemble a piece while fitting those pixels worse than independent tile noise.
+	if (
+		reader.detectsCovers &&
+		cameraBackground &&
+		ranked[0]!.template.sprite!.piece.kind.code !== 'ob' &&
+		ranked[0]!.residual > PIECE_FIT_RATIO * background.residual &&
+		(ranked[0]!.noise ?? 0) > cameraBackground.noise + 2 * cameraBackground.noiseUncertainty
+	)
+		return { kind: 'obscured' };
+	if (
+		reader.detectsCovers &&
+		cameraBackground &&
+		cameraBackground.interior <=
+			cameraBackground.noise + 6 * cameraBackground.noiseUncertainty &&
+		(ranked[0]!.residual > 0.5 * background.residual ||
+			(ranked[0]!.response?.gain ?? 1) < 0.5) &&
+		(ranked[0]!.noise ?? 0) > cameraBackground.noise + 3 * cameraBackground.noiseUncertainty
+	)
+		return { kind: 'obscured' };
 	if (
 		reader.detectsCovers &&
 		Math.min(ranked[0]!.residual, background.residual) > unexplained * samples &&
@@ -141,8 +410,19 @@ export function classify(
 	// Noise on a photographed bare tile remains even when its glyph fits exactly. Discount
 	// that shared error, bounded so a poor glyph fit still needs visible shape evidence.
 	const sharedNoise =
-		matcher.photographed && (ranked[0]!.noise ?? 0) <= 0.03
-			? Math.min(0.2 * background.residual, (ranked[0]!.noise ?? 0) * samples)
+		matcher.photographed &&
+		(ranked[0]!.noise ?? 0) <= 0.03 &&
+		(ranked[0]!.template.sprite!.piece.kind.code === 'ob' ||
+			(ranked[0]!.noise ?? 0) <=
+				cameraBackground!.noise + 2 * cameraBackground!.noiseUncertainty)
+			? Math.min(
+					(ranked[0]!.template.sprite!.piece.kind.code === 'ob' &&
+					cameraBackground!.interior >
+						cameraBackground!.noise + 2 * cameraBackground!.noiseUncertainty
+						? 0.6
+						: 0.2) * background.residual,
+					(ranked[0]!.noise ?? 0) * samples,
+				)
 			: 0;
 	if (ranked[0]!.residual - sharedNoise > PIECE_FIT_RATIO * (background.residual - sharedNoise))
 		return backgroundVerdict(mean, tiles);
@@ -182,6 +462,45 @@ function hasMeasuredCorners(view: View, { column, row }: Square): boolean {
 			`${column + 1},${row + 1}`,
 		].filter((key) => view.measuredCornerSupport?.has(key)).length >= 3
 	);
+}
+
+/** A measured crossing and four independently supported local corners also anchor a camera cell. */
+function hasLocalPhotoCorners(view: View, { column, row }: Square): boolean {
+	if (!view.pieces.local?.has(`${column},${row}`)) return false;
+	const corners = [
+		`${column},${row}`,
+		`${column + 1},${row}`,
+		`${column},${row + 1}`,
+		`${column + 1},${row + 1}`,
+	];
+	return (
+		corners.every((key) => view.cornerSupport?.has(key)) &&
+		corners.some((key) => view.measuredCornerSupport?.has(key))
+	);
+}
+
+/** An observed crossing anchors a locally calibrated camera cell's bounded shape search. */
+function hasObservedPhotoPlane(view: View, { column, row }: Square): boolean {
+	return (
+		view.pieces.local?.has(`${column},${row}`) === true &&
+		[
+			`${column},${row}`,
+			`${column + 1},${row}`,
+			`${column},${row + 1}`,
+			`${column + 1},${row + 1}`,
+		].some((key) => view.measuredCornerSupport?.has(key))
+	);
+}
+
+/** Weak camera contrast can still expose a glyph between two supported checker crossings. */
+function hasTwoPhotoCorners(view: View, { column, row }: Square): boolean {
+	const corners = [
+		`${column},${row}`,
+		`${column + 1},${row}`,
+		`${column},${row + 1}`,
+		`${column + 1},${row + 1}`,
+	];
+	return corners.filter((key) => view.cornerSupport?.has(key)).length >= 2;
 }
 
 /** A pieceless square is a void when it's clearly darker than even the dark tiles. */

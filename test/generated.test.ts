@@ -35,6 +35,7 @@ interface Capture {
 	phase: number;
 	camera: boolean;
 	densePawns?: boolean;
+	foreshortening?: number;
 	broadNoise?: boolean;
 	promotion?: { boundaries: [number, number]; color: Color };
 }
@@ -106,6 +107,27 @@ const captures: Capture[] = [
 		camera: true,
 		promotion: { boundaries: [2, 13], color: [0.36, 0.09, 0.14] },
 	},
+	{
+		name: 'foreshortened gray camera board under display noise',
+		dark: [0.38, 0.38, 0.38],
+		light: [0.67, 0.67, 0.67],
+		size: 41,
+		skew: -0.08,
+		phase: 1.7,
+		camera: true,
+		foreshortening: -0.03,
+	},
+	{
+		name: 'foreshortened colored promotion strokes under display noise',
+		dark: [0.38, 0.38, 0.38],
+		light: [0.67, 0.67, 0.67],
+		size: 41,
+		skew: -0.08,
+		phase: 1.7,
+		camera: true,
+		foreshortening: -0.03,
+		promotion: { boundaries: [2, 13], color: [0.36, 0.09, 0.14] },
+	},
 ];
 
 interface DrawnPiece {
@@ -170,8 +192,11 @@ async function render(capture: Capture): Promise<Buffer> {
 	const data = Buffer.alloc(width * height * 3);
 	for (let y = 0; y < height; y++) {
 		for (let x = 0; x < width; x++) {
-			const u = (x + 0.5 - skew * (y - height / 2)) / size + 0.25;
-			const v = (y + 0.5) / size + 0.25;
+			const screenU = (x + 0.5 - skew * (y - height / 2)) / size + 0.25;
+			const screenV = (y + 0.5) / size + 0.25;
+			const depth = 1 - (capture.foreshortening ?? 0) * (screenV - 7.5);
+			const u = capture.foreshortening ? 8.5 + (screenU - 8.5) / depth : screenU;
+			const v = capture.foreshortening ? 7.5 + (screenV - 7.5) / depth : screenV;
 			const column = Math.floor(u);
 			const row = Math.floor(v);
 			const tile = (column + row) % 2 === 0 ? dark : light;

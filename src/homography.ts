@@ -128,15 +128,19 @@ function normalizer(points: Point[]): Homography {
 }
 
 /** Solves the normal equations of an overdetermined linear system by Gauss-Jordan elimination. */
-function solveLeastSquares(rows: number[][], targets: number[]): number[] {
+export function solveLeastSquares(rows: number[][], targets: number[]): number[] {
 	const n = rows[0]!.length;
 	const m = Array.from({ length: n }, () => new Array<number>(n + 1).fill(0));
 	rows.forEach((row, r) => {
 		for (let i = 0; i < n; i++) {
-			for (let j = 0; j < n; j++) m[i]![j]! += row[i]! * row[j]!;
+			for (let j = i; j < n; j++) m[i]![j]! += row[i]! * row[j]!;
 			m[i]![n]! += row[i]! * targets[r]!;
 		}
 	});
+	// The normal matrix is symmetric; retain the same product and accumulation order once.
+	for (let i = 0; i < n; i++) {
+		for (let j = 0; j < i; j++) m[i]![j] = m[j]![i]!;
+	}
 	for (let col = 0; col < n; col++) {
 		let pivot = col;
 		for (let r = col + 1; r < n; r++)

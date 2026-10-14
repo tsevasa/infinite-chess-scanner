@@ -28,6 +28,7 @@ import {
 	isInFront,
 	project,
 	raise,
+	solveLeastSquares,
 	stretch,
 } from './homography.js';
 
@@ -49,6 +50,8 @@ export interface Plane {
 	/** Maps board-grid coordinates to image pixels: square (column, row) spans [column, column+1] x [row, row+1]. */
 	toImage: Homography;
 	toBoard: Homography;
+	/** Camera distortion corrections measured from nearby checkerboard crossings, by square. */
+	local?: ReadonlyMap<string, Homography>;
 }
 
 /** How the board's grid sits in a screenshot. */
@@ -65,6 +68,8 @@ export interface View extends Plane {
 	cornerSupport?: ReadonlySet<string>;
 	/** Intersections observed directly, before inferring small gaps in the visible grid. */
 	measuredCornerSupport?: ReadonlySet<string>;
+	/** A checker of obstacle edge midpoints, when a supported tile-grid alternative was recovered. */
+	midpointAlias?: true;
 }
 
 // Constants -------------------------------------------------------------------
@@ -115,7 +120,7 @@ export function findViews(pic: Picture, tiles: Tiles, embedded = false): View[] 
 	if (grid && !tiles.photographed && isGridOnCorners(grid, corners)) return [flatView(grid)];
 	let homographies = fitLattice(corners, pic.width, pic.height, tiles.photographed, tiles.photographed ? (h, centers) => isCheckerLattice(pic, h, centers, shades) : undefined); // prettier-ignore
 	if (tiles.photographed && (!homographies || corners.length < 150)) {
-		const localCorners = findPhotographedCorners(pic);
+		const localCorners = findPhotographedCorners(pic, Math.max(0.05, Math.min(0.12, 0.65 * colorDistance(tiles[0], tiles[1])))); // prettier-ignore
 		const local = fitLattice(
 			localCorners,
 			pic.width,
@@ -136,28 +141,44 @@ export function findViews(pic: Picture, tiles: Tiles, embedded = false): View[] 
 		}
 	}
 	if (homographies) {
+		let photoCrossings: PhotoCrossing[] | undefined;
+		const photoContrast = Math.max(
+			0.035,
+			Math.min(0.1, 0.6 * colorDistance(tiles[0], tiles[1])),
+		);
 		if (tiles.photographed) {
 			const initial = homographies[0]!;
-			const refined = refinePhotograph(pic, perspectiveView(pic, initial, true));
+			const refined = refinePhotograph(
+				pic,
+				perspectiveView(pic, initial, true),
+				photoContrast,
+			);
 			if (refined) {
-				const correction = compose(refined, invert(initial));
+				const correction = compose(refined.toImage, invert(initial));
 				homographies = homographies.map((h) => compose(correction, h));
+				photoCrossings = refined.crossings;
 			}
 		}
 		const center = embedded && !tiles.photographed ? viewportCenter(pic, shades) : undefined;
-		const views = homographies.map((toImage) => perspectiveView(pic, toImage, tiles.photographed, center, corners)); // prettier-ignore
+		const views = homographies.map((toImage) => perspectiveView(pic, toImage, tiles.photographed, center, corners, photoCrossings, photoContrast)); // prettier-ignore
 		// Closely spaced round obstacles can supply a checkerboard of edge midpoints, rotated
 		// halfway between the real axes. Keep the real-cell alternatives for piece shapes to judge.
 		if (tiles.photographed && hasAlternatingMarks(pic, views[0]!)) {
+			const alternatives: View[] = [];
 			for (const h of homographies) {
 				for (const phase of [-0.5, 0.5]) {
 					const toImage = compose(h, [1, -1, 0.5, 1, 1, phase, 0, 0, 1]);
 					const alternative = perspectiveView(pic, toImage, true, undefined, corners);
-					if ((alternative.cornerSupport?.size ?? 0) >= 16) views.push(alternative);
+					if ((alternative.cornerSupport?.size ?? 0) >= 16)
+						alternatives.push(alternative);
 				}
 			}
+			if (alternatives.length) {
+				for (const view of views) view.midpointAlias = true;
+				views.push(...alternatives);
+			}
 		}
-		if (tiles.photographed || isCheckered(pic, tiles, views[0]!)) return views;
+		if (tiles.photographed || isCheckered(pic, tiles, views[0]!, corners)) return views;
 	}
 	if (grid && !tiles.photographed) return [flatView(grid)];
 	throw gridError ?? new Error('No checkerboard with readable squares found in the image.');
@@ -193,7 +214,11 @@ function hasAlternatingMarks(pic: Picture, view: View): boolean {
  * around the preliminary grid and fit again, so visible corners throughout the board calibrate
  * the mapping instead of extrapolating from one bright area.
  */
-function refinePhotograph(pic: Picture, view: View): Homography | undefined {
+function refinePhotograph(
+	pic: Picture,
+	view: View,
+	minimumContrast: number,
+): { toImage: Homography; crossings: PhotoCrossing[] } | undefined {
 	const coordinates = new Set(view.squares.flatMap(({ column, row }) => [
 		`${column},${row}`, `${column + 1},${row}`, `${column},${row + 1}`, `${column + 1},${row + 1}`,
 	])); // prettier-ignore
@@ -227,13 +252,13 @@ function refinePhotograph(pic: Picture, view: View): Homography | undefined {
 						break;
 					}
 					const firstContrast = colorDistance(a, b);
-					if (firstContrast < 0.1) {
+					if (firstContrast < minimumContrast) {
 						checkered = false;
 						break;
 					}
 					const contrast = Math.min(firstContrast, colorDistance(c, d));
 					const variation = Math.max(colorDistance(a, c), colorDistance(b, d));
-					if (variation > 0.1 || contrast < Math.max(0.1, 2 * variation)) {
+					if (variation > 0.1 || contrast < Math.max(minimumContrast, 2 * variation)) {
 						checkered = false;
 						break;
 					}
@@ -245,7 +270,7 @@ function refinePhotograph(pic: Picture, view: View): Homography | undefined {
 				}
 			}
 		}
-		if (best) measured.set(key, [[column, row], small ? refineSmallCrossing(pic, best) : best]);
+		if (best) measured.set(key, [[column, row], refineSmallCrossing(pic, best)]);
 	}
 	// Isolated marks can resemble a crossing. A measured grid crossing has measured neighbors.
 	const pairs = [...measured.values()].filter(([[column, row]]) => [
@@ -253,7 +278,483 @@ function refinePhotograph(pic: Picture, view: View): Homography | undefined {
 	].filter((key) => measured.has(key)).length >= 2); // prettier-ignore
 	if (pairs.length < 12) return undefined;
 	const toImage = fitHomography(pairs);
-	return toImage.every(Number.isFinite) ? toImage : undefined;
+	return toImage.every(Number.isFinite)
+		? {
+				toImage,
+				crossings: pairs.map(([board, measured]) => ({
+					ideal: project(toImage, ...board),
+					measured,
+				})),
+			}
+		: undefined;
+}
+
+/** A crossing retains its grid identity even when curvature moves it toward the next cell. */
+interface PhotoCrossing {
+	ideal: Point;
+	measured: Point;
+}
+
+interface PhotoOffset {
+	offset: Point;
+	weight: number;
+	x: number;
+	y: number;
+}
+
+interface CameraCurve {
+	center: Point;
+	scale: Point;
+	x: number[];
+	y: number[];
+	precision: number;
+}
+
+/** A smooth cubic camera correction, accepted only when most measured crossings agree. */
+function photographCurve(view: View, offsets: ReadonlyMap<string, Point>): CameraCurve | undefined {
+	if (offsets.size < 80) return undefined;
+	const data = [...offsets].map(([key, offset]) => ({
+		point: project(view.toImage, ...(key.split(',').map(Number) as Point)),
+		offset,
+	}));
+	let left = Infinity,
+		right = -Infinity,
+		top = Infinity,
+		bottom = -Infinity;
+	for (const {
+		point: [x, y],
+	} of data) {
+		left = Math.min(left, x);
+		right = Math.max(right, x);
+		top = Math.min(top, y);
+		bottom = Math.max(bottom, y);
+	}
+	const center: Point = [(left + right) / 2, (top + bottom) / 2];
+	const scale: Point = [(right - left) / 2, (bottom - top) / 2];
+	const sizes = view.squares.map((s) => s.size).sort((a, b) => a - b);
+	const precision = Math.min(4, 0.12 * sizes[Math.floor(sizes.length / 2)]!);
+	const rows = data.map(({ point }) =>
+		curveTerms((point[0] - center[0]) / scale[0], (point[1] - center[1]) / scale[1]),
+	);
+	let weights = data.map(() => 1);
+	let x: number[] = [],
+		y: number[] = [],
+		errors: number[] = [];
+	for (let pass = 0; pass < 4; pass++) {
+		const weighted = rows.map((row, i) => row.map((v) => v * Math.sqrt(weights[i]!)));
+		x = solveLeastSquares(
+			weighted,
+			data.map((d, i) => d.offset[0] * Math.sqrt(weights[i]!)),
+		);
+		y = solveLeastSquares(
+			weighted,
+			data.map((d, i) => d.offset[1] * Math.sqrt(weights[i]!)),
+		);
+		if (![...x, ...y].every(Number.isFinite)) return undefined;
+		errors = rows.map((row, i) =>
+			Math.hypot(dot(row, x) - data[i]!.offset[0], dot(row, y) - data[i]!.offset[1]),
+		);
+		const nextWeights = errors.map((error) => Math.min(1, 2 / Math.max(0.01, error)));
+		if (nextWeights.every((weight, i) => weight === weights[i])) break;
+		weights = nextWeights;
+	}
+	errors.sort((a, b) => a - b);
+	if (errors[Math.floor(0.9 * errors.length)]! > precision) return undefined;
+	return { center, scale, x, y, precision };
+}
+
+/** Cubic image coordinates include radial lens curvature and a gently bowed display. */
+function curveTerms(x: number, y: number): number[] {
+	return [1, x, y, x * x, x * y, y * y, x ** 3, x * x * y, x * y * y, y ** 3];
+}
+
+function dot(a: readonly number[], b: readonly number[]): number {
+	return a.reduce((sum, value, i) => sum + value * b[i]!, 0);
+}
+
+/** The curve supplies the footprint; nearby crossings refine its small remaining translation. */
+function curvedPhotographPlane(
+	view: View,
+	square: Square,
+	curve: CameraCurve,
+	offsets: ReadonlyMap<string, Point>,
+): Homography | undefined {
+	const center = project(view.toImage, square.column + 0.5, square.row + 0.5);
+	const x = (center[0] - curve.center[0]) / curve.scale[0];
+	const y = (center[1] - curve.center[1]) / curve.scale[1];
+	const terms = curveTerms(x, y);
+	const offset: Point = [dot(terms, curve.x), dot(terms, curve.y)];
+	let dx = 0,
+		dy = 0,
+		total = 0,
+		count = 0;
+	for (const reach of [1, 4]) {
+		dx = dy = total = count = 0;
+		for (let r = square.row - reach; r <= square.row + reach + 1; r++) {
+			for (let c = square.column - reach; c <= square.column + reach + 1; c++) {
+				const actual = offsets.get(`${c},${r}`);
+				if (!actual) continue;
+				const point = project(view.toImage, c, r);
+				const terms = curveTerms(
+					(point[0] - curve.center[0]) / curve.scale[0],
+					(point[1] - curve.center[1]) / curve.scale[1],
+				);
+				const rx = actual[0] - dot(terms, curve.x),
+					ry = actual[1] - dot(terms, curve.y);
+				if (Math.hypot(rx, ry) > curve.precision) continue;
+				const weight =
+					1 / (0.5 + (c - square.column - 0.5) ** 2 + (r - square.row - 0.5) ** 2);
+				dx += rx * weight;
+				dy += ry * weight;
+				total += weight;
+				count++;
+			}
+		}
+		if (count >= 3) break;
+	}
+	if (count >= 3) {
+		offset[0] += dx / total;
+		offset[1] += dy / total;
+	}
+	const displaced = project(view.toBoard, center[0] + offset[0], center[1] + offset[1]);
+	if (
+		Math.abs(displaced[0] - square.column - 0.5) > 1.25 ||
+		Math.abs(displaced[1] - square.row - 0.5) > 1.25
+	)
+		return undefined;
+	const along = [0, 1, 0, 2 * x, y, 0, 3 * x * x, 2 * x * y, y * y, 0];
+	const across = [0, 0, 1, 0, x, 2 * y, 0, x * x, 2 * x * y, 3 * y * y];
+	const xx = dot(along, curve.x) / curve.scale[0],
+		xy = dot(across, curve.x) / curve.scale[1];
+	const yx = dot(along, curve.y) / curve.scale[0],
+		yy = dot(across, curve.y) / curve.scale[1];
+	if (Math.hypot(xx, xy, yx, yy) > 0.4) return undefined;
+	return compose(
+		[
+			1 + xx,
+			xy,
+			offset[0] - xx * center[0] - xy * center[1],
+			yx,
+			1 + yy,
+			offset[1] - yx * center[0] - yy * center[1],
+			0,
+			0,
+			1,
+		],
+		view.pieces.toImage,
+	);
+}
+
+/** Robust local slopes align a curved cell's edges as well as its center. */
+function localPhotographPlane(
+	view: View,
+	square: Square,
+	points: PhotoOffset[],
+): Homography | undefined {
+	if (points.length < 6) return undefined;
+	let weights = points.map((p) => p.weight);
+	let offset: Point = [0, 0],
+		along: Point = [0, 0],
+		across: Point = [0, 0];
+	const tolerance = Math.max(1.5, 0.04 * square.size);
+	for (let pass = 0; pass < 3; pass++) {
+		const total = weights.reduce((sum, weight) => sum + weight, 0);
+		const mx = points.reduce((sum, p, i) => sum + p.x * weights[i]!, 0) / total;
+		const my = points.reduce((sum, p, i) => sum + p.y * weights[i]!, 0) / total;
+		const mean = [0, 1].map(
+			(c) => points.reduce((sum, p, i) => sum + p.offset[c]! * weights[i]!, 0) / total,
+		);
+		let xx = 0,
+			xy = 0,
+			yy = 0;
+		const bx: Point = [0, 0],
+			by: Point = [0, 0];
+		points.forEach((p, i) => {
+			const x = p.x - mx,
+				y = p.y - my,
+				weight = weights[i]!;
+			xx += weight * x * x;
+			xy += weight * x * y;
+			yy += weight * y * y;
+			for (const c of [0, 1] as const) {
+				bx[c] += weight * x * p.offset[c];
+				by[c] += weight * y * p.offset[c];
+			}
+		});
+		const determinant = xx * yy - xy * xy;
+		if (determinant <= 0.01 * (xx + yy) ** 2) return undefined;
+		along = bx.map((v, c) => (yy * v - xy * by[c]!) / determinant) as Point;
+		across = by.map((v, c) => (xx * v - xy * bx[c]!) / determinant) as Point;
+		offset = mean.map((v, c) => v - along[c]! * mx - across[c]! * my) as Point;
+		const nextWeights = points.map((p) => {
+			const error = Math.hypot(
+				...p.offset.map((v, c) => v - offset[c]! - along[c]! * p.x - across[c]! * p.y),
+			);
+			return p.weight * Math.min(1, tolerance / Math.max(0.01, error));
+		});
+		// Unchanged weights would repeat the identical fit in every remaining pass.
+		if (nextWeights.every((weight, i) => weight === weights[i])) break;
+		weights = nextWeights;
+	}
+	const total = weights.reduce((sum, weight) => sum + weight, 0);
+	const error =
+		points.reduce(
+			(sum, p, i) =>
+				sum +
+				weights[i]! *
+					Math.hypot(
+						...p.offset.map(
+							(v, c) => v - offset[c]! - along[c]! * p.x - across[c]! * p.y,
+						),
+					),
+			0,
+		) / total;
+	if (error > tolerance || Math.hypot(...along, ...across) > 0.25 * square.size) return undefined;
+	const [c, r] = [square.column + 0.5, square.row + 0.5];
+	const center = project(view.toImage, c, r);
+	const displaced = project(view.toBoard, center[0] + offset[0], center[1] + offset[1]);
+	if (Math.abs(displaced[0] - c) > 1.25 || Math.abs(displaced[1] - r) > 1.25) return undefined;
+	const a = project(view.toImage, c + 1, r).map((v, i) => v - center[i]!) as Point;
+	const b = project(view.toImage, c, r + 1).map((v, i) => v - center[i]!) as Point;
+	const determinant = a[0] * b[1] - a[1] * b[0];
+	const xx = (along[0] * b[1] - across[0] * a[1]) / determinant;
+	const xy = (across[0] * a[0] - along[0] * b[0]) / determinant;
+	const yx = (along[1] * b[1] - across[1] * a[1]) / determinant;
+	const yy = (across[1] * a[0] - along[1] * b[0]) / determinant;
+	return compose(
+		[
+			1 + xx,
+			xy,
+			offset[0] - xx * center[0] - xy * center[1],
+			yx,
+			1 + yy,
+			offset[1] - yx * center[0] - yy * center[1],
+			0,
+			0,
+			1,
+		],
+		view.pieces.toImage,
+	);
+}
+
+/** Follow neighboring crossings so curvature cannot round an outer crossing into the next cell. */
+function connectedPhotographOffsets(view: View, crossings: PhotoCrossing[]): Map<string, Point> {
+	const points = crossings.map(({ ideal, measured }) => ({
+		point: project(view.toBoard, ...measured),
+		nominal: project(view.toBoard, ...ideal).map(Math.round) as Point,
+		measured,
+		links: [] as { next: number; column: number; row: number }[],
+	}));
+	const bins = new Map<string, number[]>();
+	points.forEach(({ point }, i) => {
+		const key = `${Math.floor(point[0])},${Math.floor(point[1])}`;
+		const bin = bins.get(key) ?? [];
+		bin.push(i);
+		bins.set(key, bin);
+	});
+	points.forEach((p, i) => {
+		for (const [column, row] of [
+			[1, 0],
+			[-1, 0],
+			[0, 1],
+			[0, -1],
+		] as Point[]) {
+			for (const step of [1, 2, 3, 4, 5]) {
+				const x = p.point[0] + step * column;
+				const y = p.point[1] + step * row;
+				let closest = -1;
+				const reach = step === 1 ? 0.3 : 0.45;
+				let error = reach * reach;
+				// Only bins intersecting the distance bound can contain an eligible crossing.
+				const left = Math.floor(x - reach),
+					right = Math.floor(x + reach);
+				const top = Math.floor(y - reach),
+					bottom = Math.floor(y + reach);
+				for (let r = top; r <= bottom; r++) {
+					for (let c = left; c <= right; c++) {
+						for (const next of bins.get(`${c},${r}`) ?? []) {
+							if (next === i) continue;
+							const other = points[next]!.point;
+							const distance = (other[0] - x) ** 2 + (other[1] - y) ** 2;
+							if (distance < error) {
+								error = distance;
+								closest = next;
+							}
+						}
+					}
+				}
+				if (closest >= 0) {
+					p.links.push({ next: closest, column: column * step, row: row * step });
+					break;
+				}
+			}
+		}
+	});
+	// A gap must agree from both ends; a nearby glyph must not redirect an entire grid branch.
+	const links = points.map((p) => p.links);
+	points.forEach((p, i) => {
+		p.links = p.links.filter((link) =>
+			links[link.next]!.some(
+				(reverse) =>
+					reverse.next === i &&
+					reverse.column === -link.column &&
+					reverse.row === -link.row,
+			),
+		);
+	});
+	const assigned = new Map<number, Point>();
+	const conflicts = new Set<number>();
+	const offsets = new Map<string, Point>();
+	const seeds = points
+		.map((_, i) => i)
+		.sort((a, b) => {
+			const error = (i: number): number => {
+				const p = points[i]!;
+				return (
+					Math.hypot(...p.nominal) +
+					0.25 * Math.hypot(p.point[0] - p.nominal[0], p.point[1] - p.nominal[1])
+				);
+			};
+			return error(a) - error(b);
+		});
+	for (const seed of seeds) {
+		if (assigned.has(seed)) continue;
+		assigned.set(seed, points[seed]!.nominal);
+		const queue = [seed];
+		for (let i = 0; i < queue.length; i++) {
+			const current = queue[i]!;
+			const [c, r] = assigned.get(current)!;
+			for (const link of points[current]!.links) {
+				const existing = assigned.get(link.next);
+				if (existing) {
+					if (existing[0] !== c + link.column || existing[1] !== r + link.row) {
+						conflicts.add(current);
+						conflicts.add(link.next);
+					}
+					continue;
+				}
+				assigned.set(link.next, [c + link.column, r + link.row]);
+				queue.push(link.next);
+			}
+		}
+		const columns = new Set(queue.map((i) => assigned.get(i)![0]));
+		const rows = new Set(queue.map((i) => assigned.get(i)![1]));
+		const connected = queue.length >= 12 && columns.size >= 3 && rows.size >= 3;
+		for (const i of queue) {
+			if (conflicts.has(i)) continue;
+			const p = points[i]!;
+			const [c, r] = connected ? assigned.get(i)! : p.nominal;
+			const limit = connected ? 1.25 : 0.4;
+			if (Math.abs(p.point[0] - c) > limit || Math.abs(p.point[1] - r) > limit) continue;
+			const key = `${c},${r}`;
+			if (!connected && offsets.has(key)) continue;
+			const predicted = project(view.toImage, c, r);
+			offsets.set(key, [p.measured[0] - predicted[0], p.measured[1] - predicted[1]]);
+		}
+	}
+	return offsets;
+}
+
+/** Smooth local crossing residuals correct lens or display curvature beyond one homography. */
+function localPhotographPlanes(
+	view: View,
+	crossings: PhotoCrossing[],
+): ReadonlyMap<string, Homography> {
+	const local = new Map<string, Homography>();
+	const displacements = crossings
+		.map(({ ideal, measured }) => Math.hypot(measured[0] - ideal[0], measured[1] - ideal[1]))
+		.sort((a, b) => a - b);
+	// An already accurate projection needs no warp from occasional glyph-shaped crossings.
+	if (!displacements.length || displacements[Math.floor(displacements.length / 2)]! < 0.5)
+		return local;
+	const offsets = connectedPhotographOffsets(view, crossings);
+	const curve = photographCurve(view, offsets);
+	if (curve) {
+		for (const square of view.squares) {
+			const plane = curvedPhotographPlane(view, square, curve, offsets);
+			if (plane) local.set(`${square.column},${square.row}`, plane);
+		}
+		return local;
+	}
+	for (const square of view.squares) {
+		let dx = 0;
+		let dy = 0;
+		let total = 0;
+		let measured = 0;
+		let calibrated: Homography | undefined;
+		for (const reach of [1, 4]) {
+			dx = dy = total = measured = 0;
+			const observed: PhotoOffset[] = [];
+			for (let r = square.row - reach; r <= square.row + reach + 1; r++) {
+				for (let c = square.column - reach; c <= square.column + reach + 1; c++) {
+					const offset = offsets.get(`${c},${r}`);
+					if (!offset) continue;
+					const weight =
+						1 / (0.5 + (c - square.column - 0.5) ** 2 + (r - square.row - 0.5) ** 2);
+					dx += offset[0] * weight;
+					dy += offset[1] * weight;
+					total += weight;
+					measured++;
+					observed.push({
+						offset,
+						weight,
+						x: c - square.column - 0.5,
+						y: r - square.row - 0.5,
+					});
+				}
+			}
+			calibrated = localPhotographPlane(view, square, observed);
+			if (calibrated) break;
+			// A glyph corner or a crossing rounded to the next cell can supply an isolated
+			// displacement. Keep the strongest group of agreeing crossings before averaging.
+			// Smooth neighborhoods need no extra search; only a wide residual spread does.
+			const tolerance = Math.max(1.5, 0.1 * square.size);
+			if (
+				observed.some(
+					({ offset }) =>
+						Math.hypot(offset[0] - dx / total, offset[1] - dy / total) > 2 * tolerance,
+				)
+			) {
+				let group: typeof observed = [];
+				let support = 0;
+				for (const { offset } of observed) {
+					const agreeing = observed.filter(
+						({ offset: other }) =>
+							Math.hypot(other[0] - offset[0], other[1] - offset[1]) <= tolerance,
+					);
+					const weight = agreeing.reduce((sum, point) => sum + point.weight, 0);
+					if (agreeing.length >= 3 && weight > support) {
+						group = agreeing;
+						support = weight;
+					}
+				}
+				measured = group.length;
+				dx = dy = total = 0;
+				for (const { offset, weight } of group) {
+					dx += offset[0] * weight;
+					dy += offset[1] * weight;
+					total += weight;
+				}
+			}
+			if (measured >= 3) break;
+		}
+		if (calibrated) {
+			local.set(`${square.column},${square.row}`, calibrated);
+			continue;
+		}
+		if (measured < 3) continue;
+		dx /= total;
+		dy /= total;
+		const movement = Math.hypot(dx, dy);
+		const center = project(view.toImage, square.column + 0.5, square.row + 0.5);
+		const shifted = project(view.toBoard, center[0] + dx, center[1] + dy);
+		if (movement < 0.05 || Math.abs(shifted[0] - square.column - 0.5) > 1.25 || Math.abs(shifted[1] - square.row - 0.5) > 1.25) continue; // prettier-ignore
+		local.set(
+			`${square.column},${square.row}`,
+			compose([1, 0, dx, 0, 1, dy, 0, 0, 1], view.pieces.toImage),
+		);
+	}
+	return local;
 }
 
 /** The saddle of an averaged crossing locates its edges within the broad quadrant-score peak. */
@@ -300,7 +801,7 @@ function viewportCenter(pic: Picture, shades: Float32Array): Point | undefined {
 	}
 	const first = rows[0];
 	const last = rows.at(-1);
-	if (first === undefined || last === undefined || first < 20 || last > pic.height - 20) return undefined; // prettier-ignore
+	if (first === undefined || last === undefined || first < 10 || last > pic.height - 10) return undefined; // prettier-ignore
 	return [pic.width / 2, (first + last + 1) / 2];
 }
 
@@ -427,18 +928,36 @@ function samePhotoGrid(reference: Homography, candidate: Homography): boolean {
  * Whether a view's squares alternate between the tile colors at their centers, as a real grid's
  * do. A lattice grown from noise, as squares too small for their corners leave, doesn't.
  */
-function isCheckered(pic: Picture, [dark, light]: Tiles, view: View): boolean {
+function isCheckered(pic: Picture, [dark, light]: Tiles, view: View, corners: Point[]): boolean {
+	// A small board or separated tile islands can share their palette with application bars.
+	// Validate the lattice where its crossings were measured, keeping unrelated UI out of the vote.
+	const measured = supportedCorners(view.toBoard, corners).measured;
+	const probes: Point[] = [
+		[0.12, 0.12],
+		[0.88, 0.12],
+		[0.12, 0.88],
+		[0.88, 0.88],
+	];
 	let even = 0;
 	let odd = 0;
 	for (const { column, row } of view.squares) {
-		const [x, y] = project(view.toImage, column + 0.5, row + 0.5);
-		const color = colorAt(pic, Math.floor(y) * pic.width + Math.floor(x));
-		if (!isTileColor(color, [dark, light])) continue;
-		const isDark = colorDistance(color, dark) < colorDistance(color, light);
+		if ([`${column},${row}`, `${column + 1},${row}`, `${column},${row + 1}`, `${column + 1},${row + 1}`].filter((key) => measured.has(key)).length < 3) continue; // prettier-ignore
+		// Pieces can occupy every center. Their clear corners still expose the checker tiles.
+		let darkVotes = 0;
+		let lightVotes = 0;
+		for (const [u, v] of probes) {
+			const [x, y] = project(view.toImage, column + u, row + v);
+			const color = colorAt(pic, Math.floor(y) * pic.width + Math.floor(x));
+			if (!isTileColor(color, [dark, light])) continue;
+			if (colorDistance(color, dark) < colorDistance(color, light)) darkVotes++;
+			else lightVotes++;
+		}
+		if (darkVotes === lightVotes || Math.max(darkVotes, lightVotes) < 2) continue;
+		const isDark = darkVotes > lightVotes;
 		if (isDark === ((((column + row) % 2) + 2) % 2 === 0)) even++;
 		else odd++;
 	}
-	return Math.max(even, odd) >= CHECKERED_AGREEMENT * (even + odd);
+	return even + odd >= 6 && Math.max(even, odd) >= CHECKERED_AGREEMENT * (even + odd);
 }
 
 /** The error for a board whose squares are all too small to read. */
@@ -466,7 +985,7 @@ function areGridCornersShown(pic: Picture, classes: Int8Array, grid: Grid): bool
 /** Whether a straight-down grid passes through the checkerboard's corners, as it does unless the board is seen at an angle. */
 function isGridOnCorners(grid: Grid, corners: Point[]): boolean {
 	if (corners.length < MIN_CORNERS_TO_CHECK) return true;
-	const tolerance = Math.max(1, 0.1 * grid.size);
+	const tolerance = Math.max(1, Math.min(2, 0.04 * grid.size));
 	const offGrid = (value: number, origin: number): number => {
 		const steps = (value - origin) / grid.size;
 		return Math.abs(steps - Math.round(steps)) * grid.size;
@@ -502,6 +1021,8 @@ function perspectiveView(
 	photographed = false,
 	center?: Point,
 	corners?: Point[],
+	photoCrossings?: PhotoCrossing[],
+	minimumContrast = 0.1,
 ): View {
 	const toBoard = invert(toImage);
 	const squares: Square[] = [];
@@ -526,9 +1047,114 @@ function perspectiveView(
 	}
 	if (squares.length === 0) throw tooSmall();
 	const piecesToImage = photographed ? toImage : raise(toImage, pic.width, pic.height, PIECE_RISE, center); // prettier-ignore
-	const pieces = { toImage: piecesToImage, toBoard: invert(piecesToImage) };
-	const support = corners && (photographed || center) ? supportedCorners(toBoard, corners, pic, toImage, squares, photographed) : undefined; // prettier-ignore
-	return { toImage, toBoard, pieces, squares, perspective: true, cornerSupport: support?.supported, measuredCornerSupport: support?.measured, ...(center ? { embedded: true as const } : {}) }; // prettier-ignore
+	const pieces: Plane = { toImage: piecesToImage, toBoard: invert(piecesToImage) };
+	const view: View = {
+		toImage,
+		toBoard,
+		pieces,
+		squares,
+		perspective: true,
+		...(center ? { embedded: true as const } : {}),
+	};
+	if (photoCrossings) {
+		pieces.local = localPhotographPlanes(view, photoCrossings);
+		// A corrected neighborhood can expose the next crossing without expanding the search.
+		for (let pass = 0; pass < 2; pass++) {
+			const recovered = recoverPhotographCrossings(pic, view, minimumContrast);
+			if (!recovered.length) break;
+			photoCrossings = [...photoCrossings, ...recovered];
+			pieces.local = localPhotographPlanes(view, photoCrossings);
+		}
+		// Calibration can move an outer tile beyond the image. Clamped sampling cannot prove
+		// that whole square visible, so apply the original bounds to its corrected footprint.
+		view.squares = squares.filter((square) => {
+			const plane = pieces.local?.get(`${square.column},${square.row}`);
+			return !plane || !!readableSquare(pic, plane, invert(plane), square.column, square.row);
+		});
+		if (!view.squares.length) throw tooSmall();
+	}
+	const support = corners && (photographed || center) ? supportedCorners(toBoard, corners, pic, toImage, view.squares, photographed, pieces.local, minimumContrast) : undefined; // prettier-ignore
+	view.cornerSupport = support?.supported;
+	view.measuredCornerSupport = support?.measured;
+	return view;
+}
+
+/** Nearby measured curvature can put a hidden crossing within a small second checker search. */
+function recoverPhotographCrossings(
+	pic: Picture,
+	view: View,
+	minimumContrast: number,
+): PhotoCrossing[] {
+	const recovered: PhotoCrossing[] = [];
+	const checked = new Set<string>();
+	for (const square of view.squares) {
+		const corrected = view.pieces.local?.get(`${square.column},${square.row}`);
+		if (!corrected) continue;
+		for (const [column, row] of [
+			[square.column, square.row],
+			[square.column + 1, square.row],
+			[square.column, square.row + 1],
+			[square.column + 1, square.row + 1],
+		]) {
+			const key = `${column},${row}`;
+			if (checked.has(key)) continue;
+			checked.add(key);
+			if (cornerQuality(pic, corrected, column!, row!, minimumContrast, square.size < 30) > 0)
+				continue;
+			let best: Point | undefined;
+			let quality = 0;
+			for (const dy of [-0.125, 0, 0.125]) {
+				for (const dx of [-0.125, 0, 0.125]) {
+					if (!dx && !dy) continue;
+					const u = column! + dx;
+					const v = row! + dy;
+					const score = cornerQuality(
+						pic,
+						corrected,
+						u,
+						v,
+						minimumContrast,
+						square.size < 30,
+					);
+					if (score > quality) {
+						quality = score;
+						best = project(corrected, u, v);
+					}
+				}
+			}
+			if (best)
+				recovered.push({
+					ideal: project(view.toImage, column!, row!),
+					measured: refineSmallCrossing(pic, best),
+				});
+		}
+	}
+	return recovered;
+}
+
+/** Only alternating local quadrants establish a crossing; glyph contrast alone cannot. */
+function cornerQuality(
+	pic: Picture,
+	h: Homography,
+	column: number,
+	row: number,
+	minimumContrast: number,
+	small: boolean,
+): number {
+	let quality = Infinity;
+	const radius = small ? 1 : 2;
+	for (const reach of small ? [0.16, 0.28] : [0.08, 0.12]) {
+		const a = colorNear(pic, h, column - reach, row - reach, radius);
+		const b = colorNear(pic, h, column + reach, row - reach, radius);
+		const c = colorNear(pic, h, column + reach, row + reach, radius);
+		const d = colorNear(pic, h, column - reach, row + reach, radius);
+		if (!a || !b || !c || !d) return 0;
+		const variation = Math.max(colorDistance(a, c), colorDistance(b, d));
+		const contrast = Math.min(colorDistance(a, b), colorDistance(c, d));
+		if (variation >= 0.1 || contrast <= Math.max(minimumContrast, 2 * variation)) return 0;
+		quality = Math.min(quality, contrast - 2 * variation);
+	}
+	return quality;
 }
 
 /** Detected intersections, supplemented by local contrast where photographic lighting hides them. */
@@ -539,6 +1165,8 @@ function supportedCorners(
 	toImage?: Homography,
 	squares?: Square[],
 	photographed = false,
+	local?: ReadonlyMap<string, Homography>,
+	minimumContrast = 0.1,
 ): { supported: ReadonlySet<string>; measured: ReadonlySet<string> } {
 	const supported = new Set<string>();
 	let measured: ReadonlySet<string> = supported;
@@ -559,7 +1187,15 @@ function supportedCorners(
 				const key = `${c},${r}`;
 				if (supported.has(key) || checked.has(key)) continue;
 				checked.add(key);
-				if (localCheckerCorner(pic, toImage, c!, r!, photographed)) supported.add(key);
+				const corrected =
+					local?.get(key) ??
+					local?.get(`${c! - 1},${r}`) ??
+					local?.get(`${c},${r! - 1}`) ??
+					local?.get(`${c! - 1},${r! - 1}`) ??
+					toImage;
+				// Faint checker intersections can establish visibility without steering
+				// the more demanding precision fit used for photographed piece sampling.
+				if (localCheckerCorner(pic, corrected, c!, r!, photographed, photographed ? Math.min(minimumContrast, 0.035) : minimumContrast)) supported.add(key); // prettier-ignore
 			}
 		}
 		measured = new Set(supported);
@@ -605,6 +1241,7 @@ function localCheckerCorner(
 	column: number,
 	row: number,
 	photographed: boolean,
+	minimumContrast = 0.1,
 ): boolean {
 	for (const radius of photographed ? [2, 3] : [0, 1]) {
 		for (const reach of photographed ? [0.08, 0.12, 0.2] : [0.18, 0.28]) {
@@ -615,7 +1252,7 @@ function localCheckerCorner(
 			if (!a || !b || !c || !d) continue;
 			const variation = Math.max(colorDistance(a, c), colorDistance(b, d));
 			const contrast = Math.min(colorDistance(a, b), colorDistance(c, d));
-			if (variation < 0.1 && contrast > Math.max(0.1, 2 * variation)) return true;
+			if (variation < 0.1 && contrast > Math.max(minimumContrast, 2 * variation)) return true;
 		}
 	}
 	return false;

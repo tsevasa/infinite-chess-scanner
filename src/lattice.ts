@@ -64,6 +64,9 @@ const MIN_LATTICE_CORNERS = 12;
 /** The rings of {@link ringOffsets}, by image width. */
 const RINGS = new Map<number, Int32Array>();
 
+/** Parsed pairs of each growing lattice; rings append entries and never replace earlier ones. */
+const LATTICE_PAIRS = new WeakMap<Map<LatticeKey, Point>, [Point, Point][]>();
+
 /** Scratch ring values for {@link isCornerNear}, reused across its calls. */
 const RING_VALUES = new Int8Array(RING_POINTS);
 
@@ -101,7 +104,7 @@ export function findCorners(pic: Picture, classes: Int8Array, shades?: Float32Ar
 }
 
 /** Camera exposure changes across a display, so each crossing supplies its own two colors. */
-export function findPhotographedCorners(pic: Picture): Point[] {
+export function findPhotographedCorners(pic: Picture, minimumContrast = 0.12): Point[] {
 	const { width, height, sat } = pic;
 	const smooth = new Float32Array(width * height * 3);
 	const brightness = new Float32Array(width * height);
@@ -142,7 +145,8 @@ export function findPhotographedCorners(pic: Picture): Point[] {
 					Math.min(
 						Math.abs(brightness[at + offsets[0]!]! - brightness[at + offsets[1]!]!),
 						Math.abs(brightness[at + offsets[2]!]! - brightness[at + offsets[3]!]!),
-					) < 0.04
+					) <
+					minimumContrast / 3
 				)
 					continue;
 				const a = (at + offsets[0]!) * 3;
@@ -158,7 +162,7 @@ export function findPhotographedCorners(pic: Picture): Point[] {
 					squaredColorDistance(smooth, a, b),
 					squaredColorDistance(smooth, c, d),
 				);
-				if (contrast > Math.max(0.0144, 3.24 * variation)) {
+				if (contrast > Math.max(minimumContrast ** 2, 3.24 * variation)) {
 					hits[at] = 1;
 					break;
 				}
@@ -535,7 +539,19 @@ function orientations(h: Homography): Homography[] {
 
 /** The lattice as (lattice point, image point) pairs. */
 function pairsOf(lattice: Map<LatticeKey, Point>): [Point, Point][] {
-	return [...lattice].map(([key, corner]) => [key.split(',').map(Number) as Point, corner]);
+	let pairs = LATTICE_PAIRS.get(lattice);
+	if (!pairs) {
+		pairs = [];
+		LATTICE_PAIRS.set(lattice, pairs);
+	}
+	const known = pairs.length;
+	if (known === lattice.size) return pairs;
+	let index = 0;
+	for (const [key, corner] of lattice) {
+		if (index++ < known) continue;
+		pairs.push([key.split(',').map(Number) as Point, corner]);
+	}
+	return pairs;
 }
 
 /** Corners bucketed into square cells, for finding those near a point without visiting all. */
@@ -569,9 +585,22 @@ class CornerIndex {
 	/** The corner nearest a point, if any is within a distance. */
 	nearest(point: Point, within: number): Point | undefined {
 		let best: Point | undefined;
-		for (const corner of this.near(point, within)) {
-			if (best === undefined || distance(corner, point) < distance(best, point))
-				best = corner;
+		let bestDistance = Infinity;
+		const reach = Math.ceil(within / CELL_SIZE);
+		const [cx, cy] = [Math.floor(point[0] / CELL_SIZE), Math.floor(point[1] / CELL_SIZE)];
+		for (let dy = -reach; dy <= reach; dy++) {
+			for (let dx = -reach; dx <= reach; dx++) {
+				for (const corner of this.cells.get(cellKey(cx + dx, cy + dy)) ?? []) {
+					const currentDistance = distance(corner, point);
+					if (
+						currentDistance <= within &&
+						(best === undefined || currentDistance < bestDistance)
+					) {
+						best = corner;
+						bestDistance = currentDistance;
+					}
+				}
+			}
 		}
 		return best;
 	}

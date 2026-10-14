@@ -19,6 +19,8 @@ import { readScreenshot } from '../src/index.js';
 interface Fixture {
 	image: string;
 	icn: string;
+	/** Independently identified camera captures, also checked by the palette tests. */
+	photographed?: true;
 	/** When the promotion lines aren't read, as when zoomed out too far for both to be drawn. */
 	promotionHidden?: true;
 	/** Black's, when the screenshot shows the board from black's side. */
@@ -154,6 +156,16 @@ function check(reading: Reading, fixture: Fixture): void {
 // Tests -----------------------------------------------------------------------
 
 const fixtures: Fixture[] = JSON.parse(fs.readFileSync(new URL('fixtures.json', FIXTURES), 'utf8'));
+
+test('every fixture image has an independently recorded expectation', () => {
+	const images = fs
+		.readdirSync(FIXTURES)
+		.filter((name) => name.endsWith('.png'))
+		.sort();
+	const registered = [...fixtures.map(({ image }) => image), 'space-too-far.png'].sort();
+	assert.deepEqual(images, registered);
+	assert.equal(new Set(registered).size, registered.length, 'Duplicate fixture registration.');
+});
 
 for (const fixture of fixtures) {
 	test(fixture.image, async () => {

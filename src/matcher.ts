@@ -179,6 +179,10 @@ const ALIGNED = new WeakMap<Template, Template[]>();
 /** Wider corrections used only when an unexplained glyph has measured grid support. */
 const WIDE_ALIGNED = new WeakMap<Template, Template[]>();
 
+/** Shifted templates and their sample offsets, including the bounded coarse phase recovery. */
+const TRANSLATED = new WeakMap<Template, Map<string, Template>>();
+const TRANSLATIONS = new WeakMap<Template, [number, number]>();
+
 /** Independent background evidence shared by every candidate fitting one photographic patch. */
 const CAMERA_CAST_LIMITS = new WeakMap<Float32Array, number>();
 
@@ -201,19 +205,58 @@ export function sampleSquares(
 	pic: Picture,
 	toImage: Homography,
 	squares: Square[],
+	localPlanes?: ReadonlyMap<string, Homography>,
 ): SampledSquare[] {
 	const sizeClasses = sizeClassesOf(squares);
 	return squares.map((square) => {
+		const plane = localPlanes?.get(`${square.column},${square.row}`) ?? toImage;
 		const sizeClass = sizeClasses.get(square)!;
 		const margin = 1 / sizeClass.samples;
 		const corner: [number, number] = [square.column + margin, square.row + margin];
-		const glance = samplePatch(pic, toImage, corner, 1 - 2 * margin, GLANCE_SAMPLES);
+		const glance = samplePatch(pic, plane, corner, 1 - 2 * margin, GLANCE_SAMPLES);
 		if (deviation(glance, GLANCE_MASK) < GLANCE_PLAIN_THRESHOLD) {
 			return { square, sizeClass, mean: meanColor(glance, GLANCE_MASK) };
 		}
-		const patch = samplePatch(pic, toImage, [square.column, square.row], 1, sizeClass.samples);
+		const patch = samplePatch(pic, plane, [square.column, square.row], 1, sizeClass.samples);
 		return { square, sizeClass, mean: meanColor(patch, innerMask(sizeClass.samples)), patch };
 	});
+}
+
+/** Corrects a small camera sampling drift using only the independently held-out tile perimeter. */
+export function correctPhotoSampling(
+	pic: Picture,
+	toImage: Homography,
+	square: Square,
+	samples: number,
+	patch: Float32Array,
+): Float32Array | undefined {
+	const baseline = photoBackground(patch, samples);
+	let best: Float32Array | undefined;
+	let noise = 0.8 * baseline.noise;
+	const radius = Math.min(4, 0.15 * square.size);
+	for (const dy of [-radius, -radius / 2, 0, radius / 2, radius]) {
+		for (const dx of [-radius, -radius / 2, 0, radius / 2, radius]) {
+			if (!dx && !dy) continue;
+			const shifted = [
+				toImage[0]! + dx * toImage[6]!,
+				toImage[1]! + dx * toImage[7]!,
+				toImage[2]! + dx * toImage[8]!,
+				toImage[3]! + dy * toImage[6]!,
+				toImage[4]! + dy * toImage[7]!,
+				toImage[5]! + dy * toImage[8]!,
+				toImage[6]!,
+				toImage[7]!,
+				toImage[8]!,
+			];
+			const candidate = samplePatch(pic, shifted, [square.column, square.row], 1, samples);
+			const background = photoBackground(candidate, samples);
+			if (background.noise < noise) {
+				noise = background.noise;
+				best = candidate;
+			}
+		}
+	}
+	return best;
 }
 
 /** Whether a sampled square shows something on it, as a piece would. */
@@ -719,16 +762,16 @@ export function refinePhotoFits(
 	sums: PatchSums,
 	ranked: Fit[],
 	wide = false,
+	candidates = (wide ? 4 : 2) * SHORTLIST,
 ): Fit[] {
 	const alignedCache = wide ? WIDE_ALIGNED : ALIGNED;
 	return ranked
-		.slice(0, (wide ? 4 : 2) * SHORTLIST)
+		.slice(0, candidates)
 		.map((fit) => {
 			const { template } = fit;
 			let shifted = alignedCache.get(template);
 			if (!shifted) {
 				shifted = [];
-				const n = matcher.samples;
 				const offsets = wide
 					? [-2, -1.5, -1, -0.5, 0, 0.5, 1, 1.5, 2]
 					: [-1, -0.5, 0, 0.5, 1];
@@ -736,36 +779,7 @@ export function refinePhotoFits(
 					for (const dx of offsets) {
 						if (dx === 0 && dy === 0) continue;
 						if (wide && Math.abs(dx) <= 1 && Math.abs(dy) <= 1) continue;
-						const rgba = new Float32Array(n * n * 4);
-						for (let y = 0; y < n; y++) {
-							for (let x = 0; x < n; x++) {
-								const sx = x - dx;
-								const sy = y - dy;
-								const at = (y * n + x) * 4;
-								const ix = Math.floor(sx);
-								const iy = Math.floor(sy);
-								for (let oy = 0; oy < 2; oy++) {
-									for (let ox = 0; ox < 2; ox++) {
-										if (
-											ix + ox < 0 ||
-											iy + oy < 0 ||
-											ix + ox >= n ||
-											iy + oy >= n
-										)
-											continue;
-										const source = (iy + oy) * n + ix + ox;
-										const weight =
-											(ox ? sx - ix : 1 - sx + ix) *
-											(oy ? sy - iy : 1 - sy + iy);
-										rgba[at + 3]! += weight * template.alpha[source]!;
-										for (let c = 0; c < 3; c++)
-											rgba[at + c]! +=
-												weight * template.color[source * 3 + c]!;
-									}
-								}
-							}
-						}
-						shifted.push(buildTemplate(template.sprite, template.index, rgba, matcher.mask, matcher.glow)); // prettier-ignore
+						shifted.push(translatedTemplate(template, matcher, dx, dy));
 					}
 				}
 				alignedCache.set(template, shifted);
@@ -779,6 +793,133 @@ export function refinePhotoFits(
 			return fit;
 		})
 		.sort((a, b) => a.residual - b.residual);
+}
+
+/** Reopens a photographic shortlist when local drift has hidden a glyph's distinguishing edges. */
+export function recoverPhotoFits(
+	matcher: Matcher,
+	patch: Float32Array,
+	sums: PatchSums,
+	kinds?: ReadonlySet<string>,
+): Fit[] {
+	const coarse = matcher.coarse;
+	if (!coarse) {
+		return refinePhotoFits(matcher, patch, sums, rankFits(matcher, patch, sums), true);
+	}
+	const small = resample(patch, matcher.samples, coarse.samples, 3);
+	const coarseSums = patchSums(coarse, small);
+	const coarseRanked = kinds
+		? [...kinds].flatMap((kind) =>
+				coarse.variants
+					.get(kind)!
+					.map((index) => fitTemplate(coarse.template(index), coarse, small, coarseSums)),
+			)
+		: rankFits(coarse, small, coarseSums);
+	const coarseFits = refinePhotoFits(
+		coarse,
+		small,
+		coarseSums,
+		coarseRanked,
+		kinds !== undefined,
+		coarseRanked.length,
+	);
+	const phases = new Map<string, [number, number]>();
+	for (const { template } of coarseFits.slice(0, 2 * SHORTLIST)) {
+		const kind = template.sprite!.piece.kind.code;
+		if (!phases.has(kind)) phases.set(kind, TRANSLATIONS.get(template) ?? [0, 0]);
+	}
+	const scale = matcher.samples / coarse.samples;
+	const fits: Fit[] = [];
+	for (const [kind, [phaseX, phaseY]] of phases) {
+		const x = phaseX * scale,
+			y = phaseY * scale;
+		const centers: [number, number][] = [[x, y]];
+		// A fractional coarse phase can otherwise leave every whole-sample alignment
+		// unvisited. Reopen that grid only for already shortlisted photographic shapes.
+		if (kinds && (x !== Math.round(x) || y !== Math.round(y)))
+			centers.push([Math.round(x), Math.round(y)]);
+		for (const index of matcher.variants.get(kind)!) {
+			const template = matcher.template(index);
+			let best = fitTemplate(template, matcher, patch, sums);
+			for (const [centerX, centerY] of centers)
+				for (const dy of [-2, -1, 0, 1, 2])
+					for (const dx of [-2, -1, 0, 1, 2]) {
+						const shifted = translatedTemplate(template, matcher, centerX + dx, centerY + dy); // prettier-ignore
+						const fit = fitTemplate(shifted, matcher, patch, sums);
+						fit.residual += 0.002 * matcher.compared;
+						if (fit.residual < best.residual) best = fit;
+					}
+			fits.push(best);
+		}
+	}
+	return fits.sort((a, b) => a.residual - b.residual);
+}
+
+/** Shifts the original premultiplied sprite once, avoiding repeated interpolation and storage. */
+function translatedTemplate(
+	template: Template,
+	matcher: Matcher,
+	dx: number,
+	dy: number,
+): Template {
+	if (!dx && !dy) return template;
+	let shifted = TRANSLATED.get(template);
+	if (!shifted) TRANSLATED.set(template, (shifted = new Map()));
+	const key = `${dx},${dy}`;
+	const known = shifted.get(key);
+	if (known) return known;
+	const n = matcher.samples;
+	const rgba = new Float32Array(n * n * 4);
+	if (Number.isInteger(dx) && Number.isInteger(dy)) {
+		// Whole-sample shifts need one copy per pixel, with no interpolation or zero weights.
+		const left = Math.max(0, dx),
+			right = Math.min(n, n + dx);
+		for (let y = Math.max(0, dy); y < Math.min(n, n + dy); y++) {
+			for (let x = left; x < right; x++) {
+				const source = (y - dy) * n + x - dx;
+				const at = (y * n + x) * 4;
+				rgba[at] = template.color[source * 3]!;
+				rgba[at + 1] = template.color[source * 3 + 1]!;
+				rgba[at + 2] = template.color[source * 3 + 2]!;
+				rgba[at + 3] = template.alpha[source]!;
+			}
+		}
+	} else {
+		for (let y = 0; y < n; y++) {
+			const sy = y - dy;
+			const iy = Math.floor(sy);
+			for (let x = 0; x < n; x++) {
+				const sx = x - dx;
+				const ix = Math.floor(sx);
+				const at = (y * n + x) * 4;
+				for (let oy = 0; oy < 2; oy++) {
+					if (iy + oy < 0 || iy + oy >= n) continue;
+					const wy = oy ? sy - iy : 1 - sy + iy;
+					if (!wy) continue;
+					for (let ox = 0; ox < 2; ox++) {
+						if (ix + ox < 0 || ix + ox >= n) continue;
+						const weight = (ox ? sx - ix : 1 - sx + ix) * wy;
+						if (!weight) continue;
+						const source = (iy + oy) * n + ix + ox;
+						rgba[at]! += weight * template.color[source * 3]!;
+						rgba[at + 1]! += weight * template.color[source * 3 + 1]!;
+						rgba[at + 2]! += weight * template.color[source * 3 + 2]!;
+						rgba[at + 3]! += weight * template.alpha[source]!;
+					}
+				}
+			}
+		}
+	}
+	const translated = buildTemplate(
+		template.sprite,
+		template.index,
+		rgba,
+		matcher.mask,
+		matcher.glow,
+	);
+	TRANSLATIONS.set(translated, [dx, dy]);
+	shifted.set(key, translated);
+	return translated;
 }
 
 /**

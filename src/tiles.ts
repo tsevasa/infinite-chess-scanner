@@ -77,7 +77,7 @@ function hasDisplayNoise(pic: Picture): boolean {
 		total++;
 		if (pic.rgb[i * 3] === pic.rgb[(i + 1) * 3] && pic.rgb[i * 3 + 1] === pic.rgb[(i + 1) * 3 + 1] && pic.rgb[i * 3 + 2] === pic.rgb[(i + 1) * 3 + 2]) same++; // prettier-ignore
 	}
-	if (same >= 0.35 * total) return false;
+	if (same >= 0.35 * total) return same < 0.8 * total && hasInteriorNoise(pic);
 	// Resampling and JPEG compression also destroy exact equality. Their edges grow farther apart
 	// over the first few pixels; display stripes repeat, so their difference falls again. Check both
 	// axes because the camera may be turned. A substantial fall avoids noise from finite sampling.
@@ -102,7 +102,58 @@ function hasDisplayNoise(pic: Picture): boolean {
 			previous = energy;
 		}
 	}
-	return false;
+	return hasInteriorNoise(pic);
+}
+
+/** Camera texture persists inside flat tiles; resampling and JPEG ringing stay near edges. */
+function hasInteriorNoise({ width, height, rgb, sat }: Picture): boolean {
+	let bare = 0;
+	let noisy = 0;
+	let patches = 0;
+	const stride = (width + 1) * 3;
+	const mean = (x: number, y: number, channel: number): number => {
+		const a = (y - 2) * stride + (x - 2) * 3 + channel;
+		const b = a + 15;
+		const c = a + 5 * stride;
+		return (sat[c + 15]! - sat[b]! - sat[c]! + sat[a]!) / 25;
+	};
+	for (let y = 10; y < height - 10; y += 17) {
+		for (let x = 10; x < width - 10; x += 17) {
+			patches++;
+			let flat = true;
+			for (const reach of [3, 7]) {
+				let gradient = 0;
+				let crossing = 0;
+				for (let channel = 0; channel < 3; channel++) {
+					gradient += (mean(x - reach, y, channel) - mean(x + reach, y, channel)) ** 2;
+					gradient += (mean(x, y - reach, channel) - mean(x, y + reach, channel)) ** 2;
+					const a = mean(x - reach, y - reach, channel);
+					crossing += (a - mean(x + reach, y - reach, channel)) ** 2;
+					crossing += (a - mean(x - reach, y + reach, channel)) ** 2;
+					crossing += (a - mean(x + reach, y + reach, channel)) ** 2;
+				}
+				if (gradient >= 0.025 ** 2 || crossing >= 0.06 ** 2) {
+					flat = false;
+					break;
+				}
+			}
+			if (!flat) continue;
+			bare++;
+			let energy = 0;
+			for (let dy = -2; dy <= 2; dy++) {
+				for (let dx = -2; dx <= 2; dx++) {
+					const pixel = ((y + dy) * width + x + dx) * 3;
+					for (let channel = 0; channel < 3; channel++) {
+						const i = pixel + channel;
+						const smooth = (rgb[i - 3]! + rgb[i + 3]! + rgb[i - width * 3]! + rgb[i + width * 3]!) / 4; // prettier-ignore
+						energy += (rgb[i]! - smooth) ** 2;
+					}
+				}
+			}
+			if (energy > 75 * 0.008 ** 2) noisy++;
+		}
+	}
+	return bare > 0.1 * patches && noisy >= 20 && noisy > 0.03 * bare;
 }
 
 /** Checkerboard color votes from small averaged patches, at both axis and diagonal corners. */
@@ -110,8 +161,8 @@ function averagedTileColors(pic: Picture): Tiles | undefined {
 	const narrow = averagedPalette(pic, 2, [4, 7]);
 	const wide = averagedPalette(pic, 4, [12, 18]);
 	// Wider patches remove stripes that still dominate small patches, and clear text strokes.
-	// Count support relative to the area around a corner covered by each stencil. Keep a proven
-	// narrow palette when the wider stencil agrees, so glare does not unnecessarily shift it.
+	// Weight repeated support by contrast: faint display stripes cannot outweigh clearer tiles.
+	// Keep a proven narrow palette when the wider stencil agrees, so glare does not shift it.
 	let best = narrow;
 	if (wide && (!narrow || (wide.score > narrow.score && differentPalette(narrow.tiles, wide.tiles)))) best = wide; // prettier-ignore
 	return best?.tiles;
@@ -168,7 +219,9 @@ function averagedPalette(
 						mean(x + reach, y, 6);
 						mean(x, y + reach, 9);
 					}
-					if (distanceSq(0, 6) > 0.06 ** 2 || distanceSq(3, 9) > 0.06 ** 2 || distanceSq(0, 3) < 0.15 ** 2) continue; // prettier-ignore
+					const variation = Math.max(distanceSq(0, 6), distanceSq(3, 9));
+					const contrast = distanceSq(0, 3);
+					if (variation > 0.06 ** 2 || contrast < 0.08 ** 2 || contrast < 4 * variation) continue; // prettier-ignore
 					let first: RGB = [(colors[0]! + colors[6]!) / 2, (colors[1]! + colors[7]!) / 2, (colors[2]! + colors[8]!) / 2]; // prettier-ignore
 					let second: RGB = [(colors[3]! + colors[9]!) / 2, (colors[4]! + colors[10]!) / 2, (colors[5]! + colors[11]!) / 2]; // prettier-ignore
 					if (luminance(first) > luminance(second)) [first, second] = [second, first];
@@ -189,13 +242,23 @@ function averagedPalette(
 	// Small repeating obstacles can alternate at one reach. The same tile colors must meet at
 	// both reaches repeatedly to distinguish broad checkerboard squares from those repeated marks.
 	// Discard those marks before ranking: their stronger votes must not hide a real board pair.
-	const best = [...votes.values()]
-		.filter((vote) => vote.count >= 12 && vote.firstReach >= 3 && vote.secondReach >= 3)
-		.sort((a, b) => b.count - a.count)[0];
+	let best: ReturnType<typeof votes.get>;
+	let score = 1;
+	for (const vote of votes.values()) {
+		if (vote.count < 12 || vote.firstReach < 3 || vote.secondReach < 3) continue;
+		let strength = 0;
+		for (let c = 0; c < 3; c++) strength += (vote.sums[c + 3]! - vote.sums[c]!) ** 2;
+		strength /= vote.count;
+		// Weak colors need more repetitions. A few antialiased sprite corners in a distant
+		// screenshot provide too little evidence to replace its exact pixel palette.
+		if (strength <= score) continue;
+		best = vote;
+		score = strength;
+	}
 	if (!best) return undefined;
 	const tiles: Tiles = [best.sums.slice(0, 3).map((value) => value / best.count) as RGB, best.sums.slice(3).map((value) => value / best.count) as RGB]; // prettier-ignore
 	tiles.photographed = true;
-	return { tiles, score: best.count / ((reaches[0] - radius) ** 2 + (reaches[1] - radius) ** 2) };
+	return { tiles, score };
 }
 
 /** Tallies the color bin pairs meeting at checkerboard corners, read a reach away from each. */

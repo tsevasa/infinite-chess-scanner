@@ -8,31 +8,13 @@ import { findTileColors } from '../src/tiles.js';
 
 const FIXTURES = new URL('./fixtures/', import.meta.url);
 
-// These are camera captures of displays, including glare, foreground objects and tilted boards.
-const PHOTOS = new Set([
-	'core-photo.png',
-	'core-photo-partially-obscured.png',
-	'chess-photo-partially-obscured.png',
-	'space-classic-photo-partially-obscured.png',
-	'coro-photo-2.png',
-	'pawn-horde-photo.png',
-	'standarch-photo-mug.png',
-	'palace-photo-headphone.png',
-	'4x4x4x4-chess-photo-1.png',
-	'4x4x4x4-chess-photo-2.png',
-	'4x4x4x4-chess-photo-3.png',
-	'4x4x4x4-chess-photo-4.png',
-	'abundance-photo.png',
-	'chess-photo-2.png',
-	'coaip-ho-photo.png',
-	'coaip-ho-photo-2.png',
-	'coaip-no-photo.png',
-	'coaip-photo-1.png',
-	'coaip-photo-2.png',
-	'obstocean-photo-blue.png',
-	'pawndard-photo.png',
-	'pawndard-photo-2.png',
-]);
+// Capture type is independently labeled in the fixture manifest, never inferred from the reader.
+const fixtures: { image: string; photographed?: true }[] = JSON.parse(
+	await fs.readFile(new URL('fixtures.json', FIXTURES), 'utf8'),
+);
+const PHOTOS = new Set(
+	fixtures.filter((fixture) => fixture.photographed).map((fixture) => fixture.image),
+);
 
 test('keeps every fixture screenshot out of camera processing', async () => {
 	const screenshots = (await fs.readdir(FIXTURES)).filter(
@@ -52,7 +34,14 @@ test('recognizes camera captures despite their different palettes and framing', 
 });
 
 test('preserves screenshot processing after resizing, JPEG compression and contrast reduction', async () => {
-	for (const name of ['blue-wide.png', 'wood-wide.png', 'space-tilted.png']) {
+	for (const name of [
+		'blue-wide.png',
+		'wood-wide.png',
+		'space-tilted.png',
+		'persp-palace-gray.png',
+		'persp-coaip-ro-lime-fullwindow.png',
+		'persp-4x4x4x4-chess-gray-starfield.png',
+	]) {
 		const source = await fs.readFile(new URL(name, FIXTURES));
 		const variants = [
 			['JPEG', await sharp(source).jpeg({ quality: 60 }).toBuffer()],

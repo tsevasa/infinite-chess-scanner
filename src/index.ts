@@ -110,7 +110,7 @@ export async function readScreenshot(
 	sprites ??= loadSprites();
 	const pic = await loadPicture(input);
 	const tiles = findTileColors(pic);
-	const views = findViews(pic, tiles);
+	const views = findViews(pic, tiles, true);
 	const open = tiles.photographed ? undefined : openBoard(pic, tiles, views, await sprites);
 	const read = open && readBoard(pic, tiles, open, await sprites, options);
 	if (read && !read.covered) return read.reading;
@@ -142,6 +142,7 @@ function readBoard(
 		pic,
 		view,
 		tiles,
+		direct,
 		inferred: region.inferred,
 		detectsCovers: obstructed || !view.perspective,
 	};
@@ -164,7 +165,8 @@ function readBoard(
 			continue;
 		}
 		if (!direct.has(`${square.column},${square.row}`)) {
-			const neighbors = region.neighbors.get(`${square.column},${square.row}`)!;
+			const key = `${square.column},${square.row}`;
+			const neighbors = region.neighbors.get(key)!;
 			const edge =
 				square.column === region.extent.left ||
 				square.column === region.extent.right ||
@@ -175,6 +177,7 @@ function readBoard(
 				verdict.kind === 'empty' ||
 				(tiles.photographed && verdict.kind === 'void') ||
 				(neighbors < minimumNeighbors &&
+					!region.inferred?.has(key) &&
 					(verdict.kind !== 'piece' || verdict.piece.kind.code !== 'ob'))
 			)
 				continue;
@@ -218,29 +221,36 @@ function openBoard(
 	views: View[],
 	sprites: Sprite[],
 ): Board | undefined {
+	if (views[0]!.embedded) return undefined;
 	const { view } = chooseView(pic, views.map((view) => ({ view, squares: view.squares })), tiles, sprites); // prettier-ignore
-	const sampled = sampleSquares(pic, view.pieces.toImage, view.squares);
+	const sampled = sampleSquares(pic, view.pieces.toImage, view.squares, view.pieces.local);
 	if (isObstructed(sampled, tiles)) return undefined;
 	return { view, region: openRegion(sampled, tiles), sampled, obstructed: false };
 }
 
 /** The board around whatever covers it: menus, the browser around it, or a photo's foreground. */
 function obstructedBoard(pic: Picture, tiles: Tiles, views: View[], sprites: Sprite[]): Board {
-	// Bars around the board move the camera's center off the image's.
-	if (!tiles.photographed && views[0]!.perspective) views = findViews(pic, tiles, true);
 	const candidates: { view: View; squares: Square[]; region: BoardRegion }[] = [];
 	let regionError: unknown;
-	for (const view of views) {
-		try {
-			const region = findBoardRegion(pic, view, tiles);
-			candidates.push({ view, squares: region.squares, region });
-		} catch (error) {
-			regionError = error;
+	// Orientation selection discards obstacle midpoint aliases whenever actual tile views
+	// succeed. Build those regions first, reserving aliases for the same fallback as before.
+	for (const alternatives of [
+		views.filter((view) => !view.midpointAlias),
+		views.filter((view) => view.midpointAlias),
+	]) {
+		for (const view of alternatives) {
+			try {
+				const region = findBoardRegion(pic, view, tiles);
+				candidates.push({ view, squares: region.squares, region });
+			} catch (error) {
+				regionError = error;
+			}
 		}
+		if (candidates.length) break;
 	}
 	if (candidates.length === 0) throw regionError;
 	const { view, region } = chooseView(pic, candidates, tiles, sprites);
-	const sampled = sampleSquares(pic, view.pieces.toImage, [...region.squares, ...region.candidates]); // prettier-ignore
+	const sampled = sampleSquares(pic, view.pieces.toImage, [...region.squares, ...region.candidates], view.pieces.local); // prettier-ignore
 	const extent = tiles.photographed ? region.extent : findBoardExtent(sampled, tiles);
 	return { view, region: { ...region, extent }, sampled, obstructed: true };
 }
@@ -252,6 +262,8 @@ function chooseView<T extends { view: View; squares: Square[] }>(
 	tiles: Tiles,
 	sprites: Sprite[],
 ): T {
+	const actualCells = candidates.filter(({ view }) => !view.midpointAlias);
+	if (actualCells.length > 0) candidates = actualCells;
 	if (candidates.length === 1) return candidates[0]!;
 	const scores = candidates.map(({ view, squares }) => {
 		const ordered = [...squares].sort((a, b) => b.size - a.size);
@@ -259,7 +271,7 @@ function chooseView<T extends { view: View; squares: Square[] }>(
 		const largest = ordered
 			.filter((_, index) => index % stride === 0)
 			.slice(0, ORIENTATION_SEARCH);
-		const busy = sampleSquares(pic, view.pieces.toImage, largest)
+		const busy = sampleSquares(pic, view.pieces.toImage, largest, view.pieces.local)
 			.filter((square) => isBusy(square))
 			.filter(
 				(square) =>

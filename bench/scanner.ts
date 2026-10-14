@@ -17,6 +17,9 @@ const DEFAULT_FIXTURES = [
 	'4x4x4x4-chess-photo-4.png',
 	'abundance-photo.png',
 	'obstocean-photo-blue.png',
+	'persp-4x4x4x4-chess-gray-starfield.png',
+	'confined-classical-photo-blue.png',
+	'chess-photo-orange-wide.png',
 ];
 
 /** How many timed reads each fixture gets, after one to warm up. */
